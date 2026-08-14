@@ -1,6 +1,12 @@
 # Strategic merge patch applied to jet-system/Deployment/jet.
 # The mgmt-plane chart ships this Deployment with no SA, no volumes, and no mounts.
-# This patch adds the three pieces jet ≥4.9.10 needs to talk mTLS to auth-service.
+# This patch adds the three pieces jet >=4.9.10 needs to talk mTLS to auth-service.
+# apiVersion/kind/metadata are required so kustomize can identify the patch target.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: jet
+  namespace: jet-system
 spec:
   template:
     spec:

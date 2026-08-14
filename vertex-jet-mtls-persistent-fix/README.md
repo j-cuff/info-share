@@ -25,13 +25,25 @@ with. The chart itself is unchanged; the overlay lives beside your release invoc
 
 ## Files in this bundle
 
-* `kustomization.yaml`   — declares the overlay
+* `README.md`                   — this file, describing the helm post-renderer flow
+* `MANUAL-APPLY.md`             — how to apply the two YAMLs by hand if you're not ready to
+  wire up the post-renderer yet
 * `certificate-jet-authtls.yaml` — creates `Certificate/auth-tls` in `jet-system` (correct
   CN and SANs, auto-renewed by cert-manager)
 * `patch-jet-deployment.yaml`    — strategic merge patch: volume + mount + SA on the jet
-  Deployment
-* `post-render.sh` — trivial wrapper helm invokes; `helm` pipes its rendered manifest to this
-  script's stdin, expects kustomized YAML on stdout
+  Deployment. Includes `apiVersion/kind/metadata` so both `kustomize` and
+  `kubectl patch --patch-file` accept it directly.
+* `post-render.sh`               — the helm post-renderer. `helm --post-renderer` pipes its
+  rendered manifest to this script's stdin; it stages the two YAMLs alongside, composes a
+  kustomization inline, and streams kustomized YAML back to helm on stdout.
+
+Two entry points:
+
+* **Manual apply (for now)**: follow [MANUAL-APPLY.md](MANUAL-APPLY.md) — two `kubectl`
+  commands, immediate fix. Trade-off: the Deployment patch reverts on the next `helm upgrade`
+  of the mgmt-plane chart (Certificate survives).
+* **Durable (for every install/upgrade)**: use `post-render.sh` as documented below — no
+  helm-upgrade drift.
 
 ## One-time prep — remove the wrong-shape Certificate from your cluster
 
