@@ -1,5 +1,15 @@
 # Persistent fix — jet ↔ auth-service mTLS on VerteX
 
+> ⚠️ **Read this before deploying**: the same `TextConsumer` / `V1AuthCertsGet` error jet
+> throws when it can't reach auth-service is produced by THREE different root causes —
+> wrong URL in `hubble-info`, corporate proxy / cloud broker intercepting HTTPS, and
+> (rarely) an actual mTLS gate. This bundle addresses **only the mTLS case**. Do NOT
+> deploy it until you've run the diagnostic in
+> [../mgmt-plane-connectivity-diagnostic/](../mgmt-plane-connectivity-diagnostic/) and
+> confirmed the mTLS mode is what's actually happening. In our experience so far, the
+> mTLS mode is the LEAST common of the three — proxy interception is by far the most
+> common.
+
 **What this bundle does:** makes the jet ↔ auth-service mTLS wiring survive every
 `helm install` / `helm upgrade` of the mgmt-plane chart. No kubectl patches to redo, no manual
 copies to remember, no reconcile loops fighting each other.
