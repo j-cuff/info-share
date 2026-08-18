@@ -28,14 +28,19 @@ of failure we've had to debug in the field.
      pod network, where the CASB catches them — even though jet and auth-service are in the
      same cluster.
    * *If yes, two fix paths (see the diagnostic runbook for detail):*
-     - **Path A (preferred long-term):** the customer's network team adds a proxy bypass
+     - **Path A (preferred end-state):** the customer's network team adds a proxy bypass
        rule for HTTPS to `<mgmt-plane hostname>:443`, no SSL inspection, no redirect. This
        is a change-management ask — factor lead time into the engagement schedule.
-     - **Path B (install-time immediate):** apply the split-horizon DNS workaround via
-       CoreDNS on the mgmt cluster so intra-cluster traffic resolves the mgmt-plane
-       hostname to the Traefik `ClusterIP`. Field-proven, undocumented by Spectro. Example
-       Corefile snippet: `examples/coredns-split-horizon-corefile.yaml`. Only fixes
-       intra-cluster egress; workload clusters in other VPCs still need Path A.
+     - **Path B (durable install-time pattern):** apply the split-horizon DNS workaround
+       via CoreDNS on the mgmt cluster so intra-cluster traffic resolves the mgmt-plane
+       hostname to the Traefik `ClusterIP`. Empirically durable — verified on our SE sandbox
+       across a mgmt-plane chart upgrade (4.9.8 → 4.9.18). Chart doesn't touch CoreDNS, so
+       `helm upgrade` cannot reconcile the override away. Underlying chart gap is tracked at
+       [SUS-1958](https://spectrocloud.atlassian.net/browse/SUS-1958); confirmed by
+       Sustaining as unlikely to land in near-term releases, so treat Path B as the
+       long-term answer for intra-cluster traffic, not a bridge. Example Corefile snippet:
+       `examples/coredns-split-horizon-corefile.yaml`. Only fixes intra-cluster egress;
+       workload clusters in other VPCs still need Path A.
    * *Do NOT recommend* `reachSystem.enabled=true` in the helm values as a fix — that
      configures Palette's own outbound proxy usage (a different scenario), not inbound
      interception. Enabling it may be independently useful for pack-sync-through-proxy

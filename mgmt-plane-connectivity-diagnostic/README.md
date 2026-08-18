@@ -148,7 +148,7 @@ Give the customer's network team this exact ask:
 
 Lead time here is the customer's change-management cycle, usually days.
 
-**Path B (immediate, install-time) — split-horizon DNS via CoreDNS on the mgmt cluster.**
+**Path B (durable, install-time) — split-horizon DNS via CoreDNS on the mgmt cluster.**
 
 For traffic that ORIGINATES INSIDE the mgmt cluster (this includes jet talking to
 auth-service in a self-hosted VerteX install), resolve the mgmt-plane hostname to the
@@ -157,9 +157,18 @@ network and never reaches the CASB. External traffic (browsers, workload cluster
 networks) continues to resolve to the public ELB IP and route through whatever egress path
 they normally use.
 
-This is the "Rule 2b" pattern named in the internal workspace CLAUDE.md. **It is NOT
-documented in Spectro's docs today** — it's a field-proven install-time workaround. A worked
-example is in [`examples/coredns-split-horizon-corefile.yaml`](examples/coredns-split-horizon-corefile.yaml).
+**This is the durable long-term pattern for restricted / CASB environments — not a bridge.**
+The underlying chart gap (no override for `hubble-info.apiEndpoint` / `.url` separate from
+`config.env.rootDomain`) has been confirmed by Sustaining and is tracked as
+**[SUS-1958](https://spectrocloud.atlassian.net/browse/SUS-1958)**; the chart-side fix is
+characterized as an architectural change unlikely to land in near-term releases. In the
+meantime, split-horizon DNS is empirically durable — verified on our internal SE sandbox
+where the override has been in place since 2026-06-26 and has survived a full mgmt-plane
+chart upgrade (4.9.8 → 4.9.18) plus routine pod restarts. Chart-source inspection confirms
+`spectro-mgmt-plane` renders zero resources into `kube-system` and has zero references to
+`coredns` or `Corefile`, so `helm upgrade` cannot reconcile the override away.
+
+A worked example is in [`examples/coredns-split-horizon-corefile.yaml`](examples/coredns-split-horizon-corefile.yaml).
 
 Caveats:
 * Only fixes egress originating INSIDE the mgmt cluster. Workload clusters in other VPCs

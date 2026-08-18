@@ -13,10 +13,23 @@
 #
 # WHEN TO USE
 # ───────────
-# - Any self-hosted VerteX / Palette install where you cannot get a CASB / SASE / SSL-
-#   inspection bypass rule from the customer's network team in time for install.
-# - As an install-time immediate mitigation while Path A (network-team bypass) is in
-#   change-management review.
+# - Any self-hosted VerteX / Palette install where CASB / SASE / SSL-inspection sits in
+#   the network path between the mgmt cluster's pods and the mgmt-plane hostname.
+# - As the DURABLE install-time pattern for intra-mgmt-cluster traffic — not just a
+#   bridge. The underlying chart gap (hubble-info.apiEndpoint / .url tied verbatim to
+#   config.env.rootDomain via spectro-jet-init, no override) is tracked as SUS-1958 but
+#   characterized by Sustaining as an architectural change unlikely to land in near-term
+#   releases. Meanwhile, split-horizon DNS has been running on our internal SE sandbox
+#   since 2026-06-26 across at least one mgmt-plane chart upgrade (4.9.8 → 4.9.18) with
+#   no reversion.
+#
+# WHY IT SURVIVES helm upgrade
+# ────────────────────────────
+# The spectro-mgmt-plane chart renders zero resources into kube-system and has zero
+# references to `coredns` or `Corefile` (grep-verified against the 4.9.18 vertex chart).
+# There is no reconciler or helm-managed resource that would revert an edit to the
+# kube-system/coredns ConfigMap. Verified empirically on our sandbox mgmt-plane through
+# a full 4.9.8 → 4.9.18 upgrade.
 #
 # NOT A REPLACEMENT FOR Path A
 # ────────────────────────────
