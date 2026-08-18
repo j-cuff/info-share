@@ -100,7 +100,7 @@ kubectl -n jet-system edit cm hubble-info
 kubectl -n jet-system rollout restart deploy/jet
 ```
 
-### Mode 2 — proxy interception (the important new one)
+### Mode 2 — proxy interception (the common one in enterprise / GovCloud)
 
 ```
 status=303 See Other        (or 302 / 307 / 200-with-injected-HTML)
@@ -109,29 +109,74 @@ Location: <some-proxy-auth-portal-URL>
 Server or Via: <proxy vendor string>
 ```
 
-**Do NOT change anything on the cluster.** The mgmt-plane is fine. Traffic from
-`jet-system` egress is being transparently intercepted by an enterprise proxy / cloud broker
+The mgmt-plane is fine. Traffic egressing from `jet-system` toward the mgmt-plane hostname
+is being transparently intercepted by an enterprise **CASB / SASE / SSL-inspection layer**
 that returns a redirect (to an auth page) or an HTML block-page. Jet's HTTP client sees
 `content-type: text/html`, invokes the go-openapi `TextConsumer` for its expected
 `*models.V1AuthCertsGet`, and panics.
 
-Fix path:
+Why this happens even when jet and auth-service live in the SAME cluster: the mgmt-plane
+hostname (`config.env.rootDomain` in the VerteX helm values) resolves to the **external**
+Traefik ELB IP, not the in-cluster ClusterIP. That means jet's request leaves the pod
+network, egresses the node, and gets caught by whatever CASB is inline on that egress path.
 
-1. **Prove it's a proxy** — verify the response is coming from something OTHER than the
-   mgmt-plane Traefik. Signals:
-   - `Server:` header lists a proxy vendor (Zscaler, Squid, BlueCoat, etc.)
-   - `Via:` header present
-   - `Location:` header points at a corporate auth portal (SSO login, click-thru NDR page)
-   - Response TLS cert (from `curl -vk`) is signed by an internal corporate CA, NOT
-     `hubble-intermicrosvccom-ca-issuer` or a public CA
-2. **Escalate to the network team** with a specific ask:
-   > "Add a proxy bypass rule for outbound HTTPS from workload-cluster pod CIDR to
-   > `<mgmt-plane hostname>` on port 443. Traffic must NOT be MITM'd or subject to SSL
-   > inspection — the mgmt-plane presents its own TLS chain that internal microservices
-   > verify against a private CA."
-3. **Do not deploy any cluster-side workaround** while waiting for the network team.
-   Don't patch jet, don't create client certificates, don't install cert-manager mirrors.
-   None of it will help — the mgmt-plane never sees the request.
+**Vendor detection** — the response usually names itself. Look at the diagnostic output for:
+
+| Vendor | Tell-tale signals |
+|---|---|
+| **Netskope** | `Location: https://auth-npaproxy-liftoff.goskope.com/...`, `Set-Cookie: npa_auth=...`, sometimes `Server: netskope` |
+| **Zscaler** | `Location: https://gateway.zscaler.net/...` or `.zsvpn.com`, `Server:` containing `Zscaler` |
+| **Palo Alto Prisma Access** | `Location:` under `.prismaaccess.com` or `.gpcloudservice.com`, `Via: prismaaccess` |
+| **Cisco Umbrella / iBoss** | `Server: iboss` or `Server: OpenDNS`, block-page HTML that names the vendor |
+| **BlueCoat / Symantec** | `Server: BlueCoat`, `X-Bluecoat-Via:` |
+| **Corporate Squid / generic** | `Via: 1.1 <squid-hostname>`, no vendor in Server but a `Via:` present |
+
+The **presence of any redirect (3xx)** or `Location:` at all when hitting `/v1/auth/certs`
+is dispositive proof. Auth-service does not redirect on that endpoint.
+
+#### Fix — two paths, ranked
+
+**Path A (preferred long-term) — network-team bypass rule.**
+
+Give the customer's network team this exact ask:
+
+> "Add a bypass rule for HTTPS traffic to `<mgmt-plane hostname>:443`. Source: everything
+> that needs to talk to the mgmt-plane (workload cluster pod CIDRs, and — for self-hosted —
+> the mgmt cluster's own pod CIDR). Traffic must NOT be MITM'd or subject to SSL inspection.
+> The mgmt-plane presents its own TLS chain that internal microservices verify against a
+> private CA; any CA substitution breaks the chain."
+
+Lead time here is the customer's change-management cycle, usually days.
+
+**Path B (immediate, install-time) — split-horizon DNS via CoreDNS on the mgmt cluster.**
+
+For traffic that ORIGINATES INSIDE the mgmt cluster (this includes jet talking to
+auth-service in a self-hosted VerteX install), resolve the mgmt-plane hostname to the
+Traefik `ClusterIP` **inside** the cluster. That way the traffic never leaves the pod
+network and never reaches the CASB. External traffic (browsers, workload clusters in other
+networks) continues to resolve to the public ELB IP and route through whatever egress path
+they normally use.
+
+This is the "Rule 2b" pattern named in the internal workspace CLAUDE.md. **It is NOT
+documented in Spectro's docs today** — it's a field-proven install-time workaround. A worked
+example is in [`examples/coredns-split-horizon-corefile.yaml`](examples/coredns-split-horizon-corefile.yaml).
+
+Caveats:
+* Only fixes egress originating INSIDE the mgmt cluster. Workload clusters in other VPCs
+  and browsers still route to the external ELB IP — for those, you still need Path A.
+* If the Traefik ClusterIP changes (rare, but possible after a mgmt-plane reinstall),
+  refresh the hosts block.
+
+**Path C (looks tempting, is wrong) — `reach-system` in the VerteX helm values.**
+
+Don't do this. `reach-system` configures Palette to egress THROUGH a corporate proxy for
+its OWN outbound internet access (pack sync, license servers, etc.). It's the opposite
+direction from what you need — the customer's problem is inbound traffic being intercepted
+by a CASB, not outbound Palette-to-internet requests. Enabling `reach-system` may be
+independently required for other reasons in the customer's environment, but it will not
+fix the jet crash-loop. See
+[reach-system doc](https://docs.spectrocloud.com/vertex/install-palette-vertex/install-on-kubernetes/vertex-helm-ref/#reach-system)
+for the actual purpose.
 
 ### Mode 3 — actual mTLS gate (rare, verify carefully)
 

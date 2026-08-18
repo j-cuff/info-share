@@ -1,0 +1,138 @@
+# Split-horizon DNS on the mgmt cluster — Path B fix for CASB / SASE proxy interception
+# of jet ↔ auth-service traffic in self-hosted Palette VerteX.
+#
+# WHAT IT DOES
+# ────────────
+# Overrides in-cluster DNS resolution of the mgmt-plane hostname so intra-cluster traffic
+# (jet-system → auth-service in hubble-system) resolves to the Traefik ClusterIP instead
+# of the external ELB IP. Traffic then never leaves the pod network — no external hop,
+# no CASB to intercept it.
+#
+# External traffic (browsers, workload clusters in other VPCs) is unaffected — they still
+# resolve the hostname to the public ELB IP via normal DNS.
+#
+# WHEN TO USE
+# ───────────
+# - Any self-hosted VerteX / Palette install where you cannot get a CASB / SASE / SSL-
+#   inspection bypass rule from the customer's network team in time for install.
+# - As an install-time immediate mitigation while Path A (network-team bypass) is in
+#   change-management review.
+#
+# NOT A REPLACEMENT FOR Path A
+# ────────────────────────────
+# This only fixes egress that ORIGINATES INSIDE THE MGMT CLUSTER. Workload clusters in
+# other VPCs still resolve the mgmt-plane hostname to the public IP and route through the
+# CASB. For those, the network-team bypass is still required.
+#
+# ALSO NOT reach-system
+# ─────────────────────
+# The reach-system value in the VerteX helm chart configures Palette to egress THROUGH a
+# corporate proxy for its own outbound calls (pack sync, license servers). It's the
+# opposite direction from this problem — do NOT enable it as a fix here.
+#
+# HOW TO APPLY
+# ────────────
+#   1. Get the current Traefik ClusterIP:
+#        kubectl -n <ingress-ns> get svc traefik -o jsonpath='{.spec.clusterIP}'
+#      (on stock VerteX installs the ingress namespace is `ingress-traefik` or `ingress-system`)
+#
+#   2. Substitute the two placeholders below:
+#        <TRAEFIK-CLUSTER-IP>    → the value from step 1
+#        <MGMT-PLANE-HOSTNAME>   → your config.env.rootDomain, exactly (e.g. vertex.example.com)
+#
+#   3. Apply this ConfigMap (it REPLACES the cluster's coredns ConfigMap; back up first):
+#        kubectl -n kube-system get cm coredns -o yaml > /tmp/coredns-backup-$(date +%s).yaml
+#        kubectl -n kube-system apply -f coredns-split-horizon-corefile.yaml
+#
+#   4. Recycle CoreDNS so it re-reads the Corefile:
+#        kubectl -n kube-system rollout restart deploy/coredns
+#        kubectl -n kube-system rollout status  deploy/coredns --timeout=60s
+#
+#   5. Verify from a debug pod in jet-system:
+#        kubectl -n jet-system run dnstest --rm -i --restart=Never \
+#          --image=curlimages/curl:8.10.1 --command --timeout=15s -- \
+#          sh -c 'nslookup <MGMT-PLANE-HOSTNAME>'
+#      Expected: hostname resolves to the Traefik ClusterIP (private RFC 1918).
+#
+#   6. Restart jet so it re-runs its Auth init with fresh DNS:
+#        kubectl -n jet-system rollout restart deploy/jet
+#
+# ROLLBACK
+# ────────
+#   kubectl -n kube-system apply -f /tmp/coredns-backup-<timestamp>.yaml
+#   kubectl -n kube-system rollout restart deploy/coredns
+#
+# ────────────────────────────────────────────────────────────────────────────────────────
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: coredns
+  namespace: kube-system
+  labels:
+    eks.amazonaws.com/component: coredns
+    k8s-app: kube-dns
+    # If your existing coredns CM has other labels/annotations, preserve them by kubectl
+    # patching instead of full-apply — see notes below the manifest.
+data:
+  Corefile: |
+    .:53 {
+        errors
+        health {
+            lameduck 5s
+        }
+        ready
+        kubernetes cluster.local in-addr.arpa ip6.arpa {
+            pods insecure
+            fallthrough in-addr.arpa ip6.arpa
+        }
+        prometheus :9153
+        forward . /etc/resolv.conf
+        cache 30
+        loop
+        reload
+        loadbalance
+
+        # ── SPLIT-HORIZON OVERRIDE FOR MGMT-PLANE HOSTNAME ────────────────────────────
+        # Any pod inside the cluster that resolves the mgmt-plane hostname gets the
+        # Traefik ClusterIP. External DNS (for browsers, workload clusters in other VPCs)
+        # is unaffected.
+        hosts {
+            <TRAEFIK-CLUSTER-IP>  <MGMT-PLANE-HOSTNAME>
+            fallthrough
+        }
+    }
+
+# ────────────────────────────────────────────────────────────────────────────────────────
+# NOTES ON THE MERGE (read before you kubectl apply)
+# ────────────────────────────────────────────────────────────────────────────────────────
+#
+# 1. Preserve your existing Corefile plugins.
+#    Different EKS + Palette installs run different plugin combinations. If your cluster
+#    already customized the Corefile (e.g. spectro-mgmt-plane installs sometimes add a
+#    palette-* zone), don't blindly replace — start from the OUTPUT of
+#    `kubectl -n kube-system get cm coredns -o yaml`, add the `hosts { ... }` block
+#    inside the `.:53` server, and apply that.
+#
+# 2. The hosts block must come BEFORE `forward . /etc/resolv.conf`.
+#    CoreDNS evaluates plugins in the order the coredns binary registers them, not
+#    strictly the Corefile order — but the hosts plugin registers before forward, so a
+#    match in hosts short-circuits the forward. Kept together above for readability.
+#
+# 3. Multiple hostnames.
+#    If you have subdomains (e.g. api.<mgmt-hostname>, dex.<mgmt-hostname>, zot.<mgmt-hostname>)
+#    that ALSO need to resolve to the ClusterIP, add them on the same line or as
+#    additional lines under `hosts { ... }`. Example:
+#      hosts {
+#          <TRAEFIK-CLUSTER-IP>  vertex.example.com  api.vertex.example.com  dex.vertex.example.com
+#          fallthrough
+#      }
+#
+# 4. Refresh cadence.
+#    CoreDNS pods only re-read the Corefile on restart (or via the `reload` plugin, which
+#    polls every 30s by default). After applying, `rollout restart deploy/coredns` is the
+#    fastest way to force pickup; otherwise wait ~30s.
+#
+# 5. Traefik ClusterIP is stable across pod restarts, but NOT across reinstalls.
+#    If someone reinstalls the ingress controller (or the whole mgmt-plane chart), the
+#    ClusterIP may change. Re-apply this CM with the new IP. Documented workaround, not a
+#    self-healing solution — a chart-level fix would be preferable long-term.

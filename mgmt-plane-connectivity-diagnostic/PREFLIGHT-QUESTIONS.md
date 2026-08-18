@@ -6,16 +6,40 @@ of failure we've had to debug in the field.
 
 ## The questions
 
-1. **Is there a corporate proxy, cloud broker, WAF, or SSL-inspection appliance between the
-   workload cluster pod network and the mgmt-plane hostname/IP?**
-   Vendors we've seen: Zscaler, Netskope, iBoss, Palo Alto Prisma Access, McAfee Web
-   Gateway, Cisco Umbrella, Symantec BlueCoat, Forcepoint, corporate Squid proxies.
-   * *Why:* transparent HTTPS interception rewrites the TLS chain and can inject redirects
-     or block pages, causing jet to receive `text/html` or a 3xx redirect instead of the
-     `application/json` body it expects. Jet's error message points at TLS but the mgmt-plane
-     never sees the request.
-   * *If yes:* they need a **proxy bypass rule for outbound HTTPS from workload cluster pod
-     CIDR → mgmt-plane hostname:443, no SSL inspection.**
+1. **Is there a CASB / SASE / corporate SSL-inspection layer between anything in your
+   network and the mgmt-plane hostname?** This is the single question that catches the
+   most-common failure mode in enterprise + GovCloud installs.
+   * Vendors specifically observed to intercept mgmt-plane traffic:
+     - **Netskope** — signature: 303 See Other redirect to `auth-npaproxy-liftoff.goskope.com`,
+       `npa_auth` cookie
+     - **Zscaler** — signature: redirect under `.zscaler.net` / `.zsvpn.com`, `Server: Zscaler`
+     - **Palo Alto Prisma Access** — signature: redirect under `.prismaaccess.com`, `Via: prismaaccess`
+     - **Cisco Umbrella, iBoss, BlueCoat/Symantec, Forcepoint, McAfee Web Gateway, corporate Squid** —
+       various redirect / block-page shapes, generally identifiable by `Server:` or `Via:` headers
+   * *Why it breaks Palette:* transparent HTTPS interception rewrites the TLS chain and
+     often injects a redirect (HTTP 303) or an HTML block/auth page. `jet` in `jet-system`
+     expects `application/json` from `/v1/auth/certs`; go-openapi sees `text/html` and
+     invokes `TextConsumer`, which panics deserializing into `*models.V1AuthCertsGet`. Jet
+     crash-loops with an error that reads like an mTLS problem but the mgmt-plane never even
+     sees the request.
+   * *Even self-hosted installs are affected.* Because `config.env.rootDomain` in the
+     helm values propagates unchanged into `hubble-info.apiEndpoint` and `hubble-info.url`,
+     jet's calls to auth-service resolve to the **external** Traefik ELB IP and egress the
+     pod network, where the CASB catches them — even though jet and auth-service are in the
+     same cluster.
+   * *If yes, two fix paths (see the diagnostic runbook for detail):*
+     - **Path A (preferred long-term):** the customer's network team adds a proxy bypass
+       rule for HTTPS to `<mgmt-plane hostname>:443`, no SSL inspection, no redirect. This
+       is a change-management ask — factor lead time into the engagement schedule.
+     - **Path B (install-time immediate):** apply the split-horizon DNS workaround via
+       CoreDNS on the mgmt cluster so intra-cluster traffic resolves the mgmt-plane
+       hostname to the Traefik `ClusterIP`. Field-proven, undocumented by Spectro. Example
+       Corefile snippet: `examples/coredns-split-horizon-corefile.yaml`. Only fixes
+       intra-cluster egress; workload clusters in other VPCs still need Path A.
+   * *Do NOT recommend* `reachSystem.enabled=true` in the helm values as a fix — that
+     configures Palette's own outbound proxy usage (a different scenario), not inbound
+     interception. Enabling it may be independently useful for pack-sync-through-proxy
+     scenarios but does not help this failure mode.
 
 2. **Is egress from workload cluster nodes/pods full-tunnel VPN'd back to a corporate
    perimeter, and does that perimeter enforce SSL inspection?**

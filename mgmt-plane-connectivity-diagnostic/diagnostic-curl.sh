@@ -56,8 +56,18 @@ kubectl -n "$NS" run "$POD" --rm -i --restart=Never \
       || echo "(openssl not available in image — install a fuller image or check manually)"
 
     echo "--- PROXY / INTERMEDIARY SIGNATURES ---"
-    grep -iE "via:|x-forwarded|x-proxy|server:|zscaler|netskope|iboss|prisma|forcepoint|bluecoat|cloudflare|akamai|mcafee|squid" /tmp/body 2>/dev/null \
-      || echo "(no obvious proxy vendor strings in body)"
+    # Explicit vendor detection — the Location and Set-Cookie headers are usually the
+    # smoking gun (block-page bodies get grep-hidden by HTML nesting).
+    printf "  netskope:      "; grep -iE "goskope\.com|npa_auth|npaproxy|npacl_state|Server:.*netskope" /tmp/body 2>/dev/null | head -3 || echo "-"
+    printf "  zscaler:       "; grep -iE "zscaler|\.zsvpn\.com|gateway\.zscaler\.net|Server:.*Zscaler" /tmp/body 2>/dev/null | head -3 || echo "-"
+    printf "  palo alto:     "; grep -iE "prismaaccess|gpcloudservice|Via:.*prismaaccess" /tmp/body 2>/dev/null | head -3 || echo "-"
+    printf "  cisco/iboss:   "; grep -iE "Server:.*iboss|opendns\.com|umbrella" /tmp/body 2>/dev/null | head -3 || echo "-"
+    printf "  bluecoat/sym:  "; grep -iE "Server:.*bluecoat|x-bluecoat" /tmp/body 2>/dev/null | head -3 || echo "-"
+    printf "  forcepoint:    "; grep -iE "forcepoint|websense" /tmp/body 2>/dev/null | head -3 || echo "-"
+    printf "  generic Via:   "; grep -iE "^via:|^X-Forwarded|^X-Proxy" /tmp/body 2>/dev/null | head -3 || echo "-"
+    echo
+    echo "  ANY match above = mode 2 (CASB / proxy interception)."
+    echo "  Note the vendor and follow README mode 2 — Path A (bypass) or Path B (split-horizon DNS)."
   '
 
 RC=$?
