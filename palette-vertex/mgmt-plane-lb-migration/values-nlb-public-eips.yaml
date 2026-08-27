@@ -1,0 +1,94 @@
+# =============================================================================
+# TARGET (AFTER — Option A) — PUBLIC NLB with pre-allocated Elastic IPs.
+#
+# When to pick this:
+#   * You want the mgmt-plane reachable over the public Internet (no PrivateLink
+#     to tenant VPCs).
+#   * You want STABLE IPs so tenant-side pins (CoreDNS phone-home, /etc/hosts,
+#     `mgmt_elb_ip` profile vars) don't invalidate on AWS-side rotation.
+#   * You're not solving a CASB-interception problem — a public NLB with EIPs
+#     doesn't stop Netskope from decrypting HTTPS to the mgmt-plane FQDN.
+#     For that, see values-nlb-internal.yaml + PrivateLink.
+#
+# Prerequisites:
+#   1. AWS Load Balancer Controller (LBC) installed on the mgmt cluster.
+#      The `type: external` annotation below tells the in-tree controller to
+#      SKIP this service; LBC picks it up. Without LBC, this whole file
+#      produces nothing (the Service stays Pending forever with no LB).
+#   2. Two Elastic IPs pre-allocated in the mgmt cluster's region — one per AZ
+#      the NLB attaches to. Note the eipalloc-... IDs; they go into the
+#      `aws-load-balancer-eip-allocations` annotation below.
+#      Recommended: tag them with `spectro:purpose = vertex-mgmt-nlb` so nobody
+#      accidentally releases them.
+#   3. Two PUBLIC subnets across those AZs the NLB can attach to. If AWS
+#      doesn't auto-detect them (Palette-provisioned clusters usually do via
+#      subnet tags `kubernetes.io/role/elb=1`), pin them explicitly via the
+#      `aws-load-balancer-subnets` annotation.
+#
+# What changes vs. values-classic-current.yaml:
+#   * ingress.annotations: {}                     →  populated (7 entries)
+#   * Everything else stays the same.
+#
+# What the render produces (differences from current):
+#   Service ingress-traefik/traefik-ingress-controller
+#     type: LoadBalancer                          # unchanged
+#     externalTrafficPolicy: Local                # unchanged
+#     annotations:
+#       service.beta.kubernetes.io/aws-load-balancer-type: "external"
+#       service.beta.kubernetes.io/aws-load-balancer-nlb-target-type: "ip"
+#       service.beta.kubernetes.io/aws-load-balancer-scheme: "internet-facing"
+#       service.beta.kubernetes.io/aws-load-balancer-cross-zone-load-balancing-enabled: "true"
+#       service.beta.kubernetes.io/aws-load-balancer-eip-allocations: "eipalloc-...,eipalloc-..."
+#       service.beta.kubernetes.io/aws-load-balancer-healthcheck-protocol: "TCP"
+#       service.beta.kubernetes.io/aws-load-balancer-healthcheck-port: "traffic-port"
+#     ports: unchanged
+# =============================================================================
+
+# Outer `ingress:` = the subchart alias in the parent chart.
+# (See values-classic-current.yaml for the full explanation of the double-nesting.)
+ingress:
+  enabled: true
+
+  traefik:
+    hostPort: false        # cloud LoadBalancer; keep false for cloud installs
+
+  # Subchart's own `ingress:` block — this is where the Service annotations live.
+  ingress:
+    annotations:
+      # LBC-managed (not in-tree). "external" tells the in-tree controller to
+      # skip; without LBC installed on the cluster, NOTHING claims this service.
+      service.beta.kubernetes.io/aws-load-balancer-type: "external"
+
+      # IP-target = NLB sends traffic directly to Pod IPs (no NodePort SNAT).
+      # Better latency, cleaner source-IP preservation than "instance" mode.
+      service.beta.kubernetes.io/aws-load-balancer-nlb-target-type: "ip"
+
+      # internet-facing NLB has a public DNS name AND the EIPs below become its
+      # external IPs. Change to "internal" for a private NLB (see the sibling
+      # values-nlb-internal.yaml file — different constraints).
+      service.beta.kubernetes.io/aws-load-balancer-scheme: "internet-facing"
+
+      # Any AZ can serve any request. Otherwise a client landing on an AZ with
+      # no backing Pod endpoint gets a connection refused.
+      service.beta.kubernetes.io/aws-load-balancer-cross-zone-load-balancing-enabled: "true"
+
+      # ─── STABLE IPs ────────────────────────────────────────────────────────
+      # Comma-separated allocation IDs, one per subnet the NLB attaches to
+      # (order matters — matches the subnet order). These IPs become the NLB's
+      # external IPs and persist across LB restarts / chart upgrades.
+      # Replace the placeholders with real EIP allocation IDs before install.
+      service.beta.kubernetes.io/aws-load-balancer-eip-allocations: "eipalloc-<AZ_A_EIP>,eipalloc-<AZ_B_EIP>"
+
+      # Optional but recommended: pin the exact subnets the NLB attaches to.
+      # Must be one PUBLIC subnet per AZ, matching the EIP allocation order.
+      # service.beta.kubernetes.io/aws-load-balancer-subnets: "subnet-<PUBLIC_A>,subnet-<PUBLIC_B>"
+
+      # Health check tuning (defaults are usually fine; make explicit for prod).
+      service.beta.kubernetes.io/aws-load-balancer-healthcheck-protocol: "TCP"
+      service.beta.kubernetes.io/aws-load-balancer-healthcheck-port: "traffic-port"
+
+    # AWS honors the EIP allocations, not spec.loadBalancerIP. Leave empty.
+    ingressStaticIP: ""
+
+    # Keep TLS termination at Traefik (unchanged from Classic).
+    terminateHTTPSAtLoadBalancer: false

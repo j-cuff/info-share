@@ -1,0 +1,209 @@
+# =============================================================================
+# Palette Infra-profile "Add Manifest" layer — CoreDNS phone-home patcher.
+#
+# WHY THIS EXISTS FOR DOMINO TENANT CLUSTERS
+# ------------------------------------------
+# Every Domino tenant cluster provisioned by Palette runs a `cluster-management-agent`
+# (CMA) that phones home to the Palette mgmt-plane via HTTPS to `<rootDomain>/v1/*`.
+# The CMA does auth-cert fetch (`/v1/auth/certs`), heartbeats, node status, pack pull.
+#
+# The two situations that break CMA outbound connectivity to the mgmt-plane:
+#
+# 1. Fake / non-public rootDomain. Some self-hosted Palette installs use a
+#    rootDomain that isn't registered in any DNS zone the tenant cluster can see
+#    (e.g. a `.local` domain used in sandbox topologies). CMA gets `no such host`
+#    and the tenant cluster never reports Ready in the Palette UI.
+#
+# 2. CASB / SASE / SSL-inspection interception. The rootDomain resolves fine to
+#    a public ELB IP but a corporate proxy (Netskope, Zscaler, Palo Alto Prisma
+#    Access, iBoss, Cisco Umbrella, Forcepoint, Menlo) intercepts the TLS
+#    handshake and injects a redirect/block page. CMA sees non-JSON, panics
+#    with `TextConsumer` errors, cluster never comes Ready.
+#
+# Both scenarios have the same fix: override CoreDNS on the tenant cluster to
+# resolve the mgmt-plane rootDomain to an IP the tenant cluster CAN reach cleanly
+# (mgmt-plane's public ELB IP if no CASB, or the private/peered IP if VPC-peered).
+#
+# This manifest runs a one-shot Job on the tenant cluster's kube-system that
+# idempotently inserts a `hosts { }` block into the CoreDNS Corefile and rolls
+# CoreDNS. Bracketed by a sentinel comment so the Job is safe to re-run on every
+# profile reconcile.
+#
+# HOW IT'S TEMPLATED
+# ------------------
+# Two Palette-style profile variable placeholders are substituted at
+# `terraform apply` time via `replace()` in host-cluster-profile.tf:
+#   {{.spectro.var.MGMT_ROOTDOMAIN}}  → the Palette mgmt-plane hostname
+#                                       (typically var.sc_host from variables.tf)
+#   {{.spectro.var.MGMT_ELB_IP}}      → the mgmt-plane's Traefik ELB IP (public)
+#                                       OR a private routable IP if VPC-peered
+#
+# ⚠️  ELB IP ROTATION CAVEAT
+# --------------------------
+# AWS Classic ELB / NLB IPs rotate. If the mgmt-plane's ELB rotates after this
+# profile has been applied, tenant clusters will fail phone-home until the profile
+# is re-applied with the new IP. Options to make this durable:
+#   (a) Rerun `terraform apply` with the updated `mgmt_elb_ip` value on every
+#       rotation. Reconciles the profile, Job re-fires, CoreDNS is repatched.
+#   (b) Use a stable NAT EIP / Route53 alias for the mgmt-plane so the IP doesn't
+#       rotate. Recommended long-term for production installs.
+#   (c) Enhance this Job to poll the mgmt-plane's DNS name and re-patch on change.
+#       Not implemented here — one more layer of complexity for a corner case.
+# See CLAUDE.md Rule 2 (b/c) for the workspace-wide notes on ELB rotation traps.
+#
+# RELATED
+#   - SUS-1958 — chart-side gap (no `hubble-info.apiEndpoint` override in the
+#     mgmt-plane helm chart). This tenant-side workaround is the field answer.
+#   - runbooks/mgmt-plane-connectivity-diagnostic/ — general docs, 3-mode
+#     diagnostic, vendor signatures, split-horizon Corefile example
+# =============================================================================
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: coredns-phonehome-config
+  namespace: kube-system
+  labels:
+    palette.spectrocloud.com/purpose: coredns-phonehome-patcher
+data:
+  # The IP that this tenant cluster should resolve the mgmt-plane rootDomain to.
+  # For non-CASB installs: mgmt-plane's public Traefik ELB IP.
+  # For CASB installs with VPC peering: the mgmt-plane's private IP via the peering.
+  COREDNS_TARGET_IP: '{{.spectro.var.MGMT_ELB_IP}}'
+
+  # Space-separated hostnames to override. For Domino tenant clusters phoning home
+  # only the Palette mgmt-plane rootDomain matters — additional subdomains (api.,
+  # dex.) can be added if the tenant cluster's agents also hit those endpoints.
+  COREDNS_HOSTNAMES: '{{.spectro.var.MGMT_ROOTDOMAIN}}'
+
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: coredns-phonehome-patcher
+  namespace: kube-system
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: coredns-phonehome-patcher
+  namespace: kube-system
+rules:
+  - apiGroups: [""]
+    resources: [configmaps]
+    resourceNames: [coredns, coredns-phonehome-config]
+    verbs: [get, patch, update]
+  - apiGroups: [""]
+    resources: [configmaps]
+    verbs: [list]
+  - apiGroups: [apps]
+    resources: [deployments, deployments/scale]
+    resourceNames: [coredns]
+    verbs: [get, patch]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: coredns-phonehome-patcher
+  namespace: kube-system
+subjects:
+  - kind: ServiceAccount
+    name: coredns-phonehome-patcher
+    namespace: kube-system
+roleRef:
+  kind: Role
+  name: coredns-phonehome-patcher
+  apiGroup: rbac.authorization.k8s.io
+
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: coredns-phonehome-patcher
+  namespace: kube-system
+  annotations:
+    palette.spectrocloud.com/purpose: >-
+      Inserts (or updates) a hosts { } block in kube-system/coredns Corefile so
+      this Domino tenant cluster can resolve the Palette mgmt-plane rootDomain to
+      a reachable IP for CMA phone-home. Idempotent — re-runs on every profile
+      reconcile without duplicating the block.
+    palette.spectrocloud.com/tracks: SUS-1958
+spec:
+  ttlSecondsAfterFinished: 600
+  backoffLimit: 3
+  template:
+    metadata:
+      labels:
+        app: coredns-phonehome-patcher
+    spec:
+      serviceAccountName: coredns-phonehome-patcher
+      restartPolicy: OnFailure
+      containers:
+        - name: patcher
+          image: bitnami/kubectl:1.30
+          envFrom:
+            - configMapRef:
+                name: coredns-phonehome-config
+          command:
+            - /bin/sh
+            - -c
+            - |
+              set -eu
+              echo "=== coredns-phonehome-patcher (Domino tenant profile layer) ==="
+              echo "  target IP:  $COREDNS_TARGET_IP"
+              echo "  hostnames:  $COREDNS_HOSTNAMES"
+
+              # Validate — refuse to run with placeholder values still in the ConfigMap.
+              # (If terraform apply didn't substitute, we'd see the raw `{{.spectro...}}`.)
+              case "$COREDNS_TARGET_IP" in
+                *"spectro.var"*|"") echo "!! COREDNS_TARGET_IP not substituted (found: '$COREDNS_TARGET_IP'). Check tfvars." >&2; exit 2 ;;
+              esac
+              case "$COREDNS_HOSTNAMES" in
+                *"spectro.var"*|"") echo "!! COREDNS_HOSTNAMES not substituted (found: '$COREDNS_HOSTNAMES'). Check tfvars." >&2; exit 2 ;;
+              esac
+
+              kubectl -n kube-system get cm coredns \
+                -o go-template='{{ index .data "Corefile" }}' > /tmp/corefile.old
+
+              # Idempotency: already correct?
+              if grep -q "$COREDNS_TARGET_IP" /tmp/corefile.old && \
+                 for h in $COREDNS_HOSTNAMES; do grep -q "$h" /tmp/corefile.old || exit 1; done then
+                echo "=== already correct — no-op ==="
+                exit 0
+              fi
+
+              # Inject or replace a sentinel-bracketed hosts block before the forward line.
+              awk -v ip="$COREDNS_TARGET_IP" -v hosts="$COREDNS_HOSTNAMES" '
+                /# BEGIN palette-phonehome/ { in_block = 1; next }
+                /# END palette-phonehome/   { in_block = 0; injected = 1
+                                              print "    # BEGIN palette-phonehome (managed by Palette profile layer)"
+                                              print "    hosts {"
+                                              print "        " ip " " hosts
+                                              print "        fallthrough"
+                                              print "    }"
+                                              print "    # END palette-phonehome"
+                                              next }
+                in_block == 1 { next }
+                /^\s*forward \. \/etc\/resolv\.conf/ && injected == 0 {
+                  print "    # BEGIN palette-phonehome (managed by Palette profile layer)"
+                  print "    hosts {"
+                  print "        " ip " " hosts
+                  print "        fallthrough"
+                  print "    }"
+                  print "    # END palette-phonehome"
+                  injected = 1
+                }
+                { print }
+              ' /tmp/corefile.old > /tmp/corefile.new
+
+              kubectl -n kube-system get cm coredns -o json \
+                | jq --rawfile new /tmp/corefile.new '.data.Corefile = $new' \
+                | kubectl apply -f -
+
+              kubectl -n kube-system rollout restart deploy/coredns
+              kubectl -n kube-system rollout status  deploy/coredns --timeout=90s
+
+              echo "=== done — CoreDNS Corefile patched, deploy restarted ==="

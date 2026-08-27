@@ -1,0 +1,171 @@
+# =============================================================================
+# Generic CoreDNS phone-home patcher — Palette "Add Manifest" layer for ANY
+# tenant / workload cluster provisioned by Palette.
+#
+# Purpose
+# -------
+# Add a `hosts { }` block to `kube-system/coredns` so this cluster resolves the
+# Palette mgmt-plane rootDomain to a specific IP — needed when:
+#   * the mgmt-plane rootDomain is a fake `.local` name (public DNS won't
+#     resolve it — CMA gets `no such host`), OR
+#   * a CASB / SASE / SSL-inspection layer (Netskope, Zscaler, Palo Alto Prisma
+#     Access, iBoss, etc.) sits between the tenant cluster's egress and the
+#     mgmt-plane's public ELB IP.
+#
+# How to use
+# ----------
+# 1. Fill in the two placeholders inline below (or wire via Palette profile
+#    variables — see the two `{{.spectro.var.*}}` alternatives in the comments):
+#        <TARGET_IP>   — the mgmt-plane Traefik ELB IP the tenant should route
+#                        to (or a private IP if VPC-peered).
+#        <ROOT_DOMAIN> — the mgmt-plane rootDomain (e.g. palette.example.com).
+# 2. Add this file as an "Add Manifest" layer in your Palette cluster profile.
+#    Order doesn't matter — the Job just patches CoreDNS on first reconcile.
+# 3. Idempotent: re-runs on every profile reconcile without duplicating the
+#    hosts block. Deleting the layer from the profile does NOT auto-revert the
+#    Corefile (you'd need to edit the CM by hand); this is deliberate — removing
+#    a phone-home mapping mid-flight would break agent traffic silently.
+#
+# Rotation caveat
+# ---------------
+# AWS Classic ELB IPs rotate. If you point <TARGET_IP> at a public ELB IP and
+# that IP rotates, this cluster's CMA will lose reachability until the profile
+# is re-applied with the new IP. For real production installs use a stable
+# NAT EIP, Route53 alias, or private-network peering upstream so the target IP
+# doesn't move. Sandbox / demo installs can just re-apply after rotation.
+#
+# Related
+# -------
+# SUS-1958 — chart-side gap (no separate hubble-info override in the mgmt-plane
+#            chart). This tenant-side manifest layer is the field workaround.
+# runbooks/mgmt-plane-connectivity-diagnostic/ — full 3-mode diagnostic and
+#            longer background on why this class of failure exists.
+# =============================================================================
+
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: coredns-phonehome-patcher
+  namespace: kube-system
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: coredns-phonehome-patcher
+  namespace: kube-system
+rules:
+  - apiGroups: [""]
+    resources: [configmaps]
+    resourceNames: [coredns]
+    verbs: [get, patch, update]
+  - apiGroups: [""]
+    resources: [configmaps]
+    verbs: [list]
+  - apiGroups: [apps]
+    resources: [deployments]
+    resourceNames: [coredns]
+    verbs: [get, patch]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: coredns-phonehome-patcher
+  namespace: kube-system
+subjects:
+  - kind: ServiceAccount
+    name: coredns-phonehome-patcher
+    namespace: kube-system
+roleRef:
+  kind: Role
+  name: coredns-phonehome-patcher
+  apiGroup: rbac.authorization.k8s.io
+
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: coredns-phonehome-patcher
+  namespace: kube-system
+spec:
+  ttlSecondsAfterFinished: 600
+  backoffLimit: 3
+  template:
+    spec:
+      serviceAccountName: coredns-phonehome-patcher
+      restartPolicy: OnFailure
+      containers:
+        - name: patcher
+          image: bitnami/kubectl:1.30
+          env:
+            # ─── Fill these two in for your environment ───────────────────────
+            # Palette profile variable alternatives:
+            #   value: '{{.spectro.var.MGMT_ELB_IP}}'
+            #   value: '{{.spectro.var.MGMT_ROOTDOMAIN}}'
+            - { name: TARGET_IP,   value: "<TARGET_IP>" }
+            - { name: ROOT_DOMAIN, value: "<ROOT_DOMAIN>" }
+            # ──────────────────────────────────────────────────────────────────
+          command:
+            - /bin/sh
+            - -c
+            - |
+              set -eu
+
+              # Sanity — refuse to run with unsubstituted placeholders
+              case "$TARGET_IP"   in *"<TARGET_IP>"*|*"spectro.var"*|"")
+                echo "!! TARGET_IP not filled in (got: '$TARGET_IP')" >&2; exit 2 ;;
+              esac
+              case "$ROOT_DOMAIN" in *"<ROOT_DOMAIN>"*|*"spectro.var"*|"")
+                echo "!! ROOT_DOMAIN not filled in (got: '$ROOT_DOMAIN')" >&2; exit 2 ;;
+              esac
+
+              echo "=== target: $TARGET_IP  $ROOT_DOMAIN ==="
+
+              # Read current Corefile
+              CURRENT=$(kubectl -n kube-system get cm coredns \
+                -o go-template='{{ index .data "Corefile" }}')
+
+              # Idempotent no-op if already correct
+              if echo "$CURRENT" | grep -q "$TARGET_IP" && \
+                 echo "$CURRENT" | grep -q "$ROOT_DOMAIN"; then
+                echo "=== already patched — no-op ==="
+                exit 0
+              fi
+
+              # Inject sentinel-bracketed hosts block before the forward line.
+              # Bracketing means subsequent runs replace the previous block
+              # cleanly instead of appending duplicates.
+              NEW=$(echo "$CURRENT" | awk -v ip="$TARGET_IP" -v host="$ROOT_DOMAIN" '
+                /# BEGIN palette-phonehome/ { in_block = 1; next }
+                /# END palette-phonehome/   { in_block = 0; injected = 1
+                                              print "    # BEGIN palette-phonehome"
+                                              print "    hosts {"
+                                              print "        " ip " " host
+                                              print "        fallthrough"
+                                              print "    }"
+                                              print "    # END palette-phonehome"
+                                              next }
+                in_block == 1 { next }
+                /^\s*forward \. \/etc\/resolv\.conf/ && injected == 0 {
+                  print "    # BEGIN palette-phonehome"
+                  print "    hosts {"
+                  print "        " ip " " host
+                  print "        fallthrough"
+                  print "    }"
+                  print "    # END palette-phonehome"
+                  injected = 1
+                }
+                { print }
+              ')
+
+              # Apply the new Corefile
+              kubectl -n kube-system get cm coredns -o json \
+                | jq --arg new "$NEW" '.data.Corefile = $new' \
+                | kubectl apply -f -
+
+              # Roll CoreDNS to pick up the change
+              kubectl -n kube-system rollout restart deploy/coredns
+              kubectl -n kube-system rollout status  deploy/coredns --timeout=90s
+              echo "=== done ==="

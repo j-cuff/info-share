@@ -1,0 +1,75 @@
+# =============================================================================
+# spectro-mgmt-plane values overlay — Pod Identity mode.
+#
+# Layer this file AFTER the environment-specific values file. Example:
+#   helm upgrade --install palette <chart>.tgz -n default \
+#     -f values-<env>.yaml \
+#     -f values-pod-identity.yaml.tmpl
+#
+# What this overlay does
+# ----------------------
+# Ensures the two chart-managed ServiceAccounts that Pod Identity Associations
+# target (spectro-hubble in hubble-system, palette-identity in palette-identity)
+# render with the names the Associations expect. All three Palette IAM roles
+# (SpectroCloudPaletteRole, SpectroCloudHubbleRole, SpectroCloudIdentityRole)
+# are attached out-of-band via the vertex-goods Terraform in this repo's root —
+# this overlay does NOT reference the role ARNs directly. The Pod Identity
+# Agent's mutating webhook injects AWS_CONTAINER_CREDENTIALS_FULL_URI +
+# AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE into pod specs at admission time
+# based on the SA→Role Association in EKS; the chart does not need to know.
+#
+# What this overlay does NOT do
+# -----------------------------
+# * Configure ECR access for specman / configserver / imageswap — the chart
+#   pattern for those components remains config.ociImageRegistry.username/
+#   password. Moving those to Pod Identity is a separate chart-level change.
+# * Enable AWS Load Balancer Controller — that's a separate install
+#   (see phase 3 of README.md).
+# * Change the NLB / LB type. Combine with values-nlb-*.yaml from
+#   ../mgmt-plane-nlb-migration/ for the LB shape.
+# =============================================================================
+
+# ─── Cluster-agent naming — the SAs the Pod Identity Associations target ────
+# These are the defaults but pinning them explicitly guards against a chart
+# refactor that renames them. If a chart bump ever changes these defaults, the
+# Associations no longer inject env vars into the new SA names and every AWS
+# call from those pods silently falls back to node role or fails.
+hubble:
+  serviceAccount:
+    create: true
+    name: spectro-hubble
+    # NO eks.amazonaws.com/role-arn annotation — that's IRSA. Pod Identity
+    # takes effect via the Association in EKS, not an annotation on the SA.
+    annotations: {}
+
+identity:
+  serviceAccount:
+    create: true
+    name: palette-identity
+    annotations: {}
+
+# ─── Turn OFF any built-in cloud-credential machinery in the chart ──────────
+# Some chart versions ship an in-tree AWS credential loader that reads from a
+# stored Secret. When Pod Identity is doing the auth, that path must be off,
+# or the AWS SDK will find those creds first and never try Pod Identity.
+config:
+  # If your chart version has these keys, unset them. Confirm by grep'ing
+  # the chart values.yaml for `awsAccessKeyId` or similar; keep only the
+  # ones your version actually renders.
+  cloudCredentials:
+    provider: pod-identity   # if the chart accepts this discriminator
+    # These next two remain empty on purpose — Pod Identity supplies creds.
+    accessKeyId: ""
+    secretAccessKey: ""
+    # role: "" # kept empty; role ARN is picked up from the Association
+
+# ─── Cluster-scoped settings that MUST match your Terraform ────────────────
+# The vertex-goods root Terraform expects `disableAssociateOIDCProvider: true`
+# on workload profiles — the mgmt-plane chart itself doesn't create an OIDC
+# provider for the mgmt cluster, but the cloud-account entry in the tenant
+# console should. Confirm this matches the TF outputs you saved from Stage 1.
+
+# ─── Ingress (leave alone here — combine with NLB overlay separately) ──────
+# See ../mgmt-plane-nlb-migration/values-nlb-{public-eips,internal}.yaml.
+# Do NOT merge NLB annotations here — keep the concerns separated so each
+# overlay can be reasoned about independently.

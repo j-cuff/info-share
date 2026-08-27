@@ -1,0 +1,245 @@
+# =============================================================================
+# csi-aws-ebs pack values — Domino host profile (FULL values; Palette REPLACES,
+# does not merge, so the whole file must be present). Based on the real deployed
+# pack values (chart aws-ebs-csi-driver 2.30.0, FIPS images gcr.io/spectro-images-fips).
+#
+# TWO edits vs the pack default (search "DOMINO EDIT"):
+#   1) added the `dominodisk` StorageClass (gp3, encrypted, expandable, NON-default)
+#   2) controller.serviceAccount.annotations → IRSA role (reconcile-proof EBS creds)
+#
+# TF: consumed via templatefile() → ${ebs_csi_irsa_role_arn} (see host-cluster-profile.tf).
+# UI: paste this into the csi-aws-ebs pack editor (or just apply the two edits inline).
+# =============================================================================
+pack:
+  content:
+    images:
+      - image: gcr.io/spectro-images-fips/aws-ebs-csi/external-provisioner:v4.0.1-eks-1-30-2
+      - image: gcr.io/spectro-images-fips/aws-ebs-csi/external-attacher:v4.5.1-eks-1-30-2
+      - image: gcr.io/spectro-images-fips/aws-ebs-csi/external-resizer:v1.10.1-eks-1-30-2
+      - image: gcr.io/spectro-images-fips/aws-ebs-csi/livenessprobe:v2.12.0-eks-1-30-2
+      - image: gcr.io/spectro-images-fips/aws-ebs-csi/driver:v1.30.0
+      - image: gcr.io/spectro-images-fips/aws-ebs-csi/node-driver-registrar:v2.10.1-eks-1-30-2
+      - image: gcr.io/spectro-images-fips/aws-ebs-csi/external-snapshotter:v7.0.2-eks-1-30-2
+      - image: gcr.io/spectro-images-fips/aws-ebs-csi/volume-modifier-for-k8s:v0.3.0
+    charts:
+      - repo: https://kubernetes-sigs.github.io/aws-ebs-csi-driver
+        name: aws-ebs-csi-driver
+        version: 2.30.0
+  namespace: "kube-system"
+
+charts:
+  aws-ebs-csi-driver:
+    storageClasses:
+    # Default Storage Class (unchanged) — stays the ONE cluster default.
+      - name: spectro-storage-class
+        annotations:
+          storageclass.kubernetes.io/is-default-class: "true"
+        volumeBindingMode: WaitForFirstConsumer
+        reclaimPolicy: Delete
+        parameters:
+          csi.storage.k8s.io/fstype: "ext4"
+          type: "gp2"
+    # ---- DOMINO EDIT 1: Domino block/RWO StorageClass (storage_classes.block.name=dominodisk) ----
+    # NON-default on purpose (Domino names it explicitly; only one SC may be is-default-class:true).
+    # gp3 + encrypted + expandable. Domino sets storage_classes.block.create=false to consume THIS.
+      - name: dominodisk
+        annotations:
+          storageclass.kubernetes.io/is-default-class: "false"
+        volumeBindingMode: WaitForFirstConsumer
+        reclaimPolicy: Delete
+        allowVolumeExpansion: true
+        parameters:
+          csi.storage.k8s.io/fstype: "ext4"
+          type: "gp3"
+          encrypted: "true"
+          # kmsKeyId: ""   # optional: phase3 KMS_KEY_ID for a CMK; omit = default aws/ebs key
+
+    image:
+      repository: gcr.io/spectro-images-fips/aws-ebs-csi/driver
+      tag: "v1.30.0"
+      pullPolicy: IfNotPresent
+
+    customLabels: {}
+
+    sidecars:
+      provisioner:
+        env: []
+        image: {pullPolicy: IfNotPresent, repository: gcr.io/spectro-images-fips/aws-ebs-csi/external-provisioner, tag: "v4.0.1-eks-1-30-2"}
+        logLevel: 2
+        additionalArgs: []
+        additionalClusterRoleRules:
+        resources: {}
+        leaderElection: {enabled: true}
+        securityContext: {readOnlyRootFilesystem: true, allowPrivilegeEscalation: false}
+      attacher:
+        env: []
+        image: {pullPolicy: IfNotPresent, repository: gcr.io/spectro-images-fips/aws-ebs-csi/external-attacher, tag: "v4.5.1-eks-1-30-2"}
+        leaderElection: {enabled: true}
+        logLevel: 2
+        additionalArgs: []
+        additionalClusterRoleRules: []
+        resources: {}
+        securityContext: {readOnlyRootFilesystem: true, allowPrivilegeEscalation: false}
+      snapshotter:
+        forceEnable: false
+        env: []
+        image: {pullPolicy: IfNotPresent, repository: gcr.io/spectro-images-fips/aws-ebs-csi/external-snapshotter, tag: "v7.0.2-eks-1-30-2"}
+        logLevel: 2
+        additionalArgs: []
+        additionalClusterRoleRules: []
+        resources: {}
+        securityContext: {readOnlyRootFilesystem: true, allowPrivilegeEscalation: false}
+      livenessProbe:
+        image: {pullPolicy: IfNotPresent, repository: gcr.io/spectro-images-fips/aws-ebs-csi/livenessprobe, tag: "v2.12.0-eks-1-30-2"}
+        additionalArgs: []
+        resources: {}
+        securityContext: {readOnlyRootFilesystem: true, allowPrivilegeEscalation: false}
+      resizer:
+        env: []
+        image: {pullPolicy: IfNotPresent, repository: gcr.io/spectro-images-fips/aws-ebs-csi/external-resizer, tag: "v1.10.1-eks-1-30-2"}
+        leaderElection: {enabled: true}
+        logLevel: 2
+        additionalArgs: []
+        additionalClusterRoleRules: []
+        resources: {}
+        securityContext: {readOnlyRootFilesystem: true, allowPrivilegeEscalation: false}
+      nodeDriverRegistrar:
+        env: []
+        image: {pullPolicy: IfNotPresent, repository: gcr.io/spectro-images-fips/aws-ebs-csi/node-driver-registrar, tag: "v2.10.1-eks-1-30-2"}
+        logLevel: 2
+        additionalArgs: []
+        resources: {}
+        securityContext: {readOnlyRootFilesystem: true, allowPrivilegeEscalation: false}
+        livenessProbe:
+          exec:
+            command:
+            - /csi-node-driver-registrar
+            - --kubelet-registration-path=$(DRIVER_REG_SOCK_PATH)
+            - --mode=kubelet-registration-probe
+          initialDelaySeconds: 30
+          periodSeconds: 90
+          timeoutSeconds: 15
+      volumemodifier:
+        env: []
+        image: {pullPolicy: IfNotPresent, repository: gcr.io/spectro-images-fips/aws-ebs-csi/volume-modifier-for-k8s, tag: "v0.3.0"}
+        leaderElection: {enabled: true}
+        logLevel: 2
+        additionalArgs: []
+        resources: {}
+        securityContext: {readOnlyRootFilesystem: true, allowPrivilegeEscalation: false}
+
+    proxy: {http_proxy: , no_proxy: }
+    imagePullSecrets: []
+    nameOverride:
+    fullnameOverride:
+    awsAccessSecret: {name: aws-secret, keyId: key_id, accessKey: access_key}
+
+    controller:
+      batching: true
+      volumeModificationFeature: {enabled: false}
+      additionalArgs: []
+      sdkDebugLog: false
+      loggingFormat: text
+      affinity:
+        nodeAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 1
+            preference:
+              matchExpressions:
+              - {key: eks.amazonaws.com/compute-type, operator: NotIn, values: [fargate]}
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - podAffinityTerm:
+              labelSelector:
+                matchExpressions:
+                - {key: app, operator: In, values: [ebs-csi-controller]}
+              topologyKey: kubernetes.io/hostname
+            weight: 100
+      defaultFsType: ext4
+      env: []
+      envFrom: []
+      extraCreateMetadata: true
+      extraVolumeTags: {}
+      httpEndpoint:
+      enableMetrics: false
+      serviceMonitor: {forceEnable: false, labels: {release: prometheus}}
+      k8sTagClusterId:
+      logLevel: 2
+      userAgentExtra: "helm"
+      nodeSelector: {}
+      deploymentAnnotations: {}
+      podAnnotations: {}
+      podLabels: {}
+      priorityClassName: system-cluster-critical
+      region:
+      replicaCount: 2
+      revisionHistoryLimit: 10
+      socketDirVolume: {emptyDir: {}}
+      updateStrategy: {type: RollingUpdate, rollingUpdate: {maxUnavailable: 1}}
+      resources:
+        requests: {cpu: 10m, memory: 40Mi}
+        limits: {cpu: 100m, memory: 256Mi}
+      serviceAccount:
+        create: true
+        name: ebs-csi-controller-sa
+        # ---- DOMINO EDIT 2: IRSA role (Palette reconciles managed node-role policies OFF, so bind
+        # EBS creds to the SA instead — reconcile-proof). Role from phase3 (EBS_CSI_IRSA_ROLE_ARN).
+        annotations:
+          eks.amazonaws.com/role-arn: "${ebs_csi_irsa_role_arn}"
+        automountServiceAccountToken: true
+      tolerations:
+        - {key: CriticalAddonsOnly, operator: Exists}
+        - {effect: NoExecute, operator: Exists, tolerationSeconds: 300}
+      topologySpreadConstraints: []
+      securityContext: {runAsNonRoot: true, runAsUser: 1000, runAsGroup: 1000, fsGroup: 1000}
+      volumes: []
+      volumeMounts: []
+      containerSecurityContext: {readOnlyRootFilesystem: true, allowPrivilegeEscalation: false}
+      initContainers: []
+      otelTracing: {}
+
+    node:
+      env: []
+      envFrom: []
+      kubeletPath: /var/lib/kubelet
+      loggingFormat: text
+      logLevel: 2
+      priorityClassName:
+      additionalArgs: []
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+            - matchExpressions:
+              - {key: eks.amazonaws.com/compute-type, operator: NotIn, values: [fargate]}
+              - key: node.kubernetes.io/instance-type
+                operator: NotIn
+                values: [a1.medium, a1.large, a1.xlarge, a1.2xlarge, a1.4xlarge]
+      nodeSelector: {}
+      daemonSetAnnotations: {}
+      podAnnotations: {}
+      podLabels: {}
+      tolerateAllTaints: true
+      tolerations:
+      - {operator: Exists, effect: NoExecute, tolerationSeconds: 300}
+      resources:
+        requests: {cpu: 10m, memory: 40Mi}
+        limits: {cpu: 100m, memory: 256Mi}
+      revisionHistoryLimit: 10
+      probeDirVolume: {emptyDir: {}}
+      serviceAccount: {create: true, name: ebs-csi-node-sa, annotations: {}, automountServiceAccountToken: true}
+      enableLinux: true
+      enableWindows: false
+      reservedVolumeAttachments:
+      volumeAttachLimit:
+      updateStrategy: {type: RollingUpdate, rollingUpdate: {maxUnavailable: "10%"}}
+      hostNetwork: false
+      securityContext: {runAsNonRoot: false, runAsUser: 0, runAsGroup: 0, fsGroup: 0}
+      volumes: []
+      volumeMounts: []
+      containerSecurityContext: {readOnlyRootFilesystem: true, privileged: true}
+      otelTracing: {}
+
+    additionalDaemonSets:
+    volumeSnapshotClasses: []
+    useOldCSIDriver: false

@@ -1,0 +1,91 @@
+# =============================================================================
+# TARGET (AFTER — Option B) — INTERNAL NLB with pre-allocated private IPs.
+#
+# When to pick this:
+#   * Tenant VPCs will reach the mgmt-plane over a PRIVATE network path — VPC
+#     peering, Transit Gateway, or AWS PrivateLink (VPC Endpoint Service).
+#   * You want to eliminate CASB / SASE interception by keeping traffic on
+#     AWS's private network. An internal NLB behind a VPC Endpoint Service is
+#     the mgmt-plane side of the PrivateLink pattern discussed in the
+#     dns-split-horizon customer preflight.
+#   * You accept that the mgmt-plane will NOT be reachable from the public
+#     Internet directly. Operators need to connect through the same private
+#     path tenants use.
+#
+# Prerequisites:
+#   1. AWS Load Balancer Controller installed on the mgmt cluster.
+#   2. Two PRIVATE subnets (one per AZ) where the NLB will attach. These are
+#      typically the subnets tagged `kubernetes.io/role/internal-elb=1`.
+#   3. Two unassigned IPs pre-selected within those subnets' CIDR ranges. These
+#      become the NLB's stable private IPs.
+#      NOTE: internal NLBs cannot use Elastic IPs — EIPs are public-only.
+#      Use `aws-load-balancer-private-ipv4-addresses` instead (below).
+#   4. Downstream reachability plan: VPC peering / TGW / PrivateLink Endpoint
+#      Service in place, plus a Route53 private hosted zone associating the
+#      mgmt-plane rootDomain with those private IPs. Without this, no tenant
+#      cluster (or operator) reaches the mgmt-plane at all.
+#
+# What changes vs. values-classic-current.yaml:
+#   * ingress.annotations: {}  →  populated (7 entries; note DIFFERENT set than
+#                                 the public-EIP variant — scheme, IP hint, and
+#                                 subnet-pinning annotations differ).
+#   * Everything else stays the same.
+#
+# What the render produces:
+#   Service ingress-traefik/traefik-ingress-controller
+#     type: LoadBalancer                          # unchanged
+#     externalTrafficPolicy: Local                # unchanged
+#     annotations:
+#       service.beta.kubernetes.io/aws-load-balancer-type: "external"
+#       service.beta.kubernetes.io/aws-load-balancer-nlb-target-type: "ip"
+#       service.beta.kubernetes.io/aws-load-balancer-scheme: "internal"
+#       service.beta.kubernetes.io/aws-load-balancer-cross-zone-load-balancing-enabled: "true"
+#       service.beta.kubernetes.io/aws-load-balancer-private-ipv4-addresses: "<PRIVATE_IP_A>,<PRIVATE_IP_B>"
+#       service.beta.kubernetes.io/aws-load-balancer-subnets: "subnet-<PRIVATE_A>,subnet-<PRIVATE_B>"
+#       service.beta.kubernetes.io/aws-load-balancer-healthcheck-protocol: "TCP"
+#       service.beta.kubernetes.io/aws-load-balancer-healthcheck-port: "traffic-port"
+# =============================================================================
+
+# Outer `ingress:` = the subchart alias in the parent chart.
+# (See values-classic-current.yaml for the full explanation of the double-nesting.)
+ingress:
+  enabled: true
+
+  traefik:
+    hostPort: false
+
+  # Subchart's own `ingress:` block — this is where the Service annotations live.
+  ingress:
+    annotations:
+      # AWS Load Balancer Controller claims this Service.
+      service.beta.kubernetes.io/aws-load-balancer-type: "external"
+
+      # IP-target = NLB sends traffic directly to Pod IPs (no NodePort SNAT).
+      service.beta.kubernetes.io/aws-load-balancer-nlb-target-type: "ip"
+
+      # ─── The scheme change — this is the critical delta vs. public NLB. ────
+      # "internal" → NLB gets a private DNS name (something like
+      #              internal-<hash>.elb.<region>.amazonaws.com resolving to
+      #              private IPs) and no public presence.
+      service.beta.kubernetes.io/aws-load-balancer-scheme: "internal"
+
+      service.beta.kubernetes.io/aws-load-balancer-cross-zone-load-balancing-enabled: "true"
+
+      # ─── STABLE PRIVATE IPs ────────────────────────────────────────────────
+      # Comma-separated private IPs, one per subnet-pinning below (order matches).
+      # Each IP MUST fall within the CIDR of the matched subnet AND must not
+      # already be assigned to any other ENI.
+      # Internal NLBs cannot use EIPs — use this annotation instead.
+      service.beta.kubernetes.io/aws-load-balancer-private-ipv4-addresses: "<PRIVATE_IP_A>,<PRIVATE_IP_B>"
+
+      # ─── Pin the private subnets the NLB attaches to. ──────────────────────
+      # Required when using aws-load-balancer-private-ipv4-addresses so the
+      # controller knows which subnet each IP belongs to.
+      service.beta.kubernetes.io/aws-load-balancer-subnets: "subnet-<PRIVATE_A>,subnet-<PRIVATE_B>"
+
+      # Health check tuning.
+      service.beta.kubernetes.io/aws-load-balancer-healthcheck-protocol: "TCP"
+      service.beta.kubernetes.io/aws-load-balancer-healthcheck-port: "traffic-port"
+
+    ingressStaticIP: ""
+    terminateHTTPSAtLoadBalancer: false

@@ -1,0 +1,186 @@
+# =============================================================================
+# csi-aws-efs pack values — Domino host profile (FULL values; Palette REPLACES,
+# does NOT merge — the whole file must be present). Based on the shipped 3.2.0
+# pack defaults (chart aws-efs-csi-driver 4.2.0, images us-docker.pkg.dev/palette-images).
+#
+# PURPOSE: let Palette's pack OWN the EFS CSI driver + the `dominoshared` (RWX) SC —
+# symmetric with csi-aws-ebs owning `dominodisk`. Domino then sets
+# storage_classes.shared.create=false and just consumes `dominoshared` (its static
+# RWX PVs bind to the pack-provided efs.csi.aws.com driver). This removes the
+# efs.csi.aws.com CSIDriver ownership collision (same class of failure as EBS).
+#
+# EDITS vs the shipped default (search "DOMINO EDIT"):
+#   1) SC renamed to `dominoshared` and is-default-class -> "false"
+#      (csi-aws-ebs `spectro-storage-class` is the ONE cluster default; two defaults break scheduling)
+#   2) SC parameters.fileSystemId -> ${efs_file_system_id}  (phase3 EFS in the CLUSTER's VPC)
+#   3) controller.serviceAccount.annotations -> IRSA role  (Palette reconciles managed node-role
+#      policies OFF, so bind EFS-AP perms to efs-csi-controller-sa via IRSA — reconcile-proof, same as EBS)
+#   4) controller.regionalStsEndpoints -> true  (GovCloud partition: IRSA must hit the regional
+#      aws-us-gov STS endpoint, not global sts.amazonaws.com — otherwise AssumeRoleWithWebIdentity
+#      can fail. Safe to leave true in commercial too.)
+#
+# AIRGAP: image repos stay on us-docker.pkg.dev/palette-images (NON-FIPS lineage) and rely on the
+# imageswap rewrite to the ECR mirror — mirror these 4 images upfront (CLAUDE.md rule 6) and flip the
+# "allow non-FIPS packages" toggle to add this layer through Palette (FIPS enforcement rejects it otherwise).
+#
+# TF: consumed via templatefile() -> ${efs_file_system_id}, ${efs_csi_irsa_role_arn}.
+# =============================================================================
+pack:
+  content:
+    images:
+      - image: us-docker.pkg.dev/palette-images/packs/aws-efs/3.2.0/aws-efs-csi-driver:v3.2.0
+      - image: us-docker.pkg.dev/palette-images/packs/aws-efs/3.2.0/livenessprobe:v2.18.0-eksbuild.4
+      - image: us-docker.pkg.dev/palette-images/packs/aws-efs/3.2.0/node-driver-registrar:v2.16.0-eksbuild.4
+      - image: us-docker.pkg.dev/palette-images/packs/aws-efs/3.2.0/external-provisioner:v6.2.0-eksbuild.3
+    charts:
+      - repo: https://kubernetes-sigs.github.io/aws-efs-csi-driver/
+        name: aws-efs-csi-driver
+        version: 4.2.0
+  namespace: kube-system
+
+charts:
+  aws-efs-csi-driver:
+    nameOverride: ""
+    fullnameOverride: ""
+    useFIPS: false   # NOTE: non-FIPS images; this flag alone does NOT make the layer FIPS-compliant.
+    portRangeUpperBound: "21049"
+    debugLogs: false
+    image:
+      repository: us-docker.pkg.dev/palette-images/packs/aws-efs/3.2.0/aws-efs-csi-driver
+      tag: "v3.2.0"
+      pullPolicy: IfNotPresent
+    sidecars:
+      livenessProbe:
+        image:
+          repository: us-docker.pkg.dev/palette-images/packs/aws-efs/3.2.0/livenessprobe
+          tag: v2.18.0-eksbuild.4
+          pullPolicy: IfNotPresent
+        resources: {}
+        securityContext: {readOnlyRootFilesystem: true, allowPrivilegeEscalation: false}
+      nodeDriverRegistrar:
+        image:
+          repository: us-docker.pkg.dev/palette-images/packs/aws-efs/3.2.0/node-driver-registrar
+          tag: v2.16.0-eksbuild.4
+          pullPolicy: IfNotPresent
+        resources: {}
+        securityContext: {readOnlyRootFilesystem: true, allowPrivilegeEscalation: false}
+      csiProvisioner:
+        image:
+          repository: us-docker.pkg.dev/palette-images/packs/aws-efs/3.2.0/external-provisioner
+          tag: v6.2.0-eksbuild.3
+          pullPolicy: IfNotPresent
+        resources: {}
+        securityContext: {readOnlyRootFilesystem: true, allowPrivilegeEscalation: false}
+        additionalArgs: []
+    imagePullSecrets: []
+
+    controller:
+      create: true
+      name: efs-csi-controller
+      replicaCount: 2
+      logLevel: 2
+      extraCreateMetadata: true
+      tags: {}
+      deleteAccessPointRootDir: false
+      podAnnotations: {}
+      podLabels: {}
+      hostNetwork: false
+      priorityClassName: system-cluster-critical
+      dnsPolicy: ClusterFirst
+      dnsConfig: {}
+      additionalLabels: {}
+      resources: {}
+      revisionHistoryLimit: 10
+      nodeSelector: {}
+      tolerations:
+        - {key: CriticalAddonsOnly, operator: Exists}
+        - {key: efs.csi.aws.com/agent-not-ready, operator: Exists}
+      affinity: {}
+      env: []
+      volumes: []
+      volumeMounts: []
+      socketDirVolume: {emptyDir: {}}
+      serviceAccount:
+        create: true
+        name: efs-csi-controller-sa
+        # ---- DOMINO EDIT 3: IRSA role (reconcile-proof EFS-AP creds; needs elasticfilesystem
+        # CreateAccessPoint/DeleteAccessPoint/DescribeAccessPoints/DescribeFileSystems/DescribeMountTargets).
+        # phase3 must create the role trusting system:serviceaccount:kube-system:efs-csi-controller-sa. ----
+        annotations:
+          eks.amazonaws.com/role-arn: "${efs_csi_irsa_role_arn}"
+      # ---- DOMINO EDIT 4: GovCloud regional STS for IRSA ----
+      regionalStsEndpoints: true
+      healthPort: 9909
+      podDisruptionBudget:
+        enabled: false
+        minAvailable: 1
+        unhealthyPodEvictionPolicy: IfHealthyBudget
+      securityContext: {runAsNonRoot: false, runAsUser: 0, runAsGroup: 0, fsGroup: 0}
+      containerSecurityContext: {privileged: true}
+      leaderElectionRenewDeadline: 10s
+      leaderElectionLeaseDuration: 15s
+      timeout: 15s
+      workerThreads: 100
+      topologySpreadConstraints: []
+      fileSystemIdRefs: {enabled: false}
+      rollingUpdate: {}
+
+    node:
+      logLevel: 2
+      volMetricsOptIn: false
+      volMetricsRefreshPeriod: 240
+      volMetricsFsRateLimit: 5
+      hostAliases: {}
+      priorityClassName: system-node-critical
+      dnsPolicy: ClusterFirst
+      dnsConfig: {}
+      podLabels: {}
+      podAnnotations: {}
+      additionalLabels: {}
+      resources: {}
+      revisionHistoryLimit: 10
+      nodeSelector: {}
+      tolerations:
+        - {operator: Exists}
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - {key: eks.amazonaws.com/compute-type, operator: NotIn, values: [fargate, hybrid]}
+      serviceAccount:
+        create: true
+        name: efs-csi-node-sa
+        annotations: {}
+        disableMutation: false
+      healthPort: 9809
+      securityContext: {runAsNonRoot: false, runAsUser: 0, runAsGroup: 0, fsGroup: 0}
+      env: []
+      volumes: []
+      volumeMounts: []
+      kubeletPath: /var/lib/kubelet
+      rollingUpdate: {}
+      efsUtilsConfOverrides: ""
+      s3filesUtilsConfOverrides: ""
+
+    storageClasses:
+    # ---- DOMINO EDIT 1+2: the `dominoshared` RWX class Domino consumes (create=false side).
+    # NON-default (EBS spectro-storage-class stays the ONE default). Immediate binding matches
+    # what Domino's agent creates today. Domino's shared-store PVs are STATIC/Retain and bind to
+    # efs.csi.aws.com regardless of who installed it — the SC name just has to match Domino's.
+      - name: dominoshared
+        annotations:
+          storageclass.kubernetes.io/is-default-class: "false"
+        mountOptions:
+          - tls
+        parameters:
+          fileSystemId: "${efs_file_system_id}"
+          provisioningMode: efs-ap
+          directoryPerms: "700"
+          gidRangeStart: "1000"
+          gidRangeEnd: "2000"
+          basePath: "/dynamic_provisioning"
+        reclaimPolicy: Delete
+        volumeBindingMode: Immediate
+
+    useHelmHooksForCSIDriver: true

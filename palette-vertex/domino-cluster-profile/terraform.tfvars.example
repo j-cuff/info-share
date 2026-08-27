@@ -1,0 +1,61 @@
+# Copy to terraform.tfvars and fill the <...> placeholders for your environment.
+# terraform.tfvars (not this .example) is what Terraform auto-loads — keep secrets there
+# and add terraform.tfvars to .gitignore.
+
+# ─── Palette API (self-hosted mgmt-plane) ─────────────────────────────────
+# Host is the API hostname of your self-hosted Palette / VerteX mgmt-plane.
+# api_key is a Tenant Console → user menu → My API Keys value.
+sc_host         = "<PALETTE_API_HOST>"    # e.g. "palette.example.com"
+sc_api_key      = "<PALETTE_API_KEY>"     # Tenant Console → My API Keys → New
+sc_project_name = "Default"
+
+# ─── AWS / cluster placement ──────────────────────────────────────────────
+# aws_cloud_account_name is the Palette-registered cloud account (Tenant
+# Console → Settings → Cloud Accounts). For VerteX / GovCloud the account
+# uses partition aws-us-gov; for commercial Palette use partition aws.
+aws_cloud_account_name = "<PALETTE_AWS_CLOUD_ACCOUNT_NAME>"
+partition              = "aws"                     # commercial; use "aws-us-gov" for GovCloud
+region                 = "<AWS_REGION>"            # e.g. "us-east-1" or "us-gov-west-1"
+azs                    = ["<AZ_A>", "<AZ_B>"]      # min 2 AZs for EKS control plane
+vpc_id                 = "<VPC_ID>"                # e.g. "vpc-0xxxxxxxxxxxxxxxx"
+
+# Static placement into an existing VPC's private subnets. EKS control plane
+# needs ≥ 2 AZs; the map keys MUST match the AZ names in var.azs.
+private_az_subnets = {
+  "<AZ_A>" = "<PRIVATE_SUBNET_A>"                  # e.g. "subnet-0xxxxxxxxxxxxxxxx"
+  "<AZ_B>" = "<PRIVATE_SUBNET_B>"
+}
+
+k8s_version = "1.30"                               # confirm mirror has this pack version
+enable_gpu  = false
+
+# ─── SSH access to worker nodes ───────────────────────────────────────────
+# EC2 key pair name that exists in your target AWS account+region. Verify with
+#   aws ec2 describe-key-pairs --region <region>
+ssh_key_name = "<EC2_KEY_PAIR_NAME>"
+
+# ─── AWS account + registry ───────────────────────────────────────────────
+# Used by locals.ecr for image-mirror path derivation and by IRSA role ARNs.
+aws_account_id = "<AWS_ACCOUNT_ID>"                # 12-digit account number
+# Optional: override ECR registry if it's not <account>.dkr.ecr.<region>.amazonaws.com
+# ecr_registry = "<ECR_REGISTRY_HOSTNAME>"
+# ecr_domino_prefix = "domino"                     # repo prefix under the registry (defaults to "domino")
+
+# ─── EFS + IRSA (for dominoshared / RWX) ──────────────────────────────────
+# Create the EFS filesystem in the SAME VPC as private_az_subnets (EFS mount
+# targets are single-VPC). Fill in after your Phase 3 prereqs run.
+efs_file_system_id    = "<EFS_FILE_SYSTEM_ID>"     # e.g. "fs-0xxxxxxxxxxxxxxxx"
+ebs_csi_irsa_role_arn = "<EBS_CSI_IRSA_ROLE_ARN>"  # arn:<partition>:iam::<account>:role/<role>
+efs_csi_irsa_role_arn = ""                         # optional; only needed for dynamic EFS-AP provisioning
+
+# ─── CoreDNS phone-home layer (OPTIONAL — see ../dns-split-horizon/) ──────
+# Leave BOTH empty for production installs with a real DNS name and no CASB.
+# Set mgmt_elb_ip ONLY when the tenant cluster can't reach the mgmt-plane
+# rootDomain via public DNS + direct HTTPS — e.g. sandbox with a fake root
+# domain, or an environment with a CASB / SSL-inspection layer in the path.
+# Prefer an AWS-native fix (Route53 private hosted zone associated with the
+# tenant VPC, PrivateLink, VPC peering) over this CoreDNS workaround — see
+# ../dns-split-horizon/README.md for the decision matrix.
+# ⚠️  AWS Classic ELB IPs rotate — set only when you have a stable target IP.
+# mgmt_elb_ip     = "<STABLE_MGMT_TARGET_IP>"
+# mgmt_rootdomain = ""                             # defaults to sc_host

@@ -1,0 +1,69 @@
+# =============================================================================
+# CURRENT (BEFORE) — values that produce the Classic ELB we have deployed today.
+#
+# ─── SHAPE / WHERE THIS GOES ────────────────────────────────────────────────
+# `spectro-mgmt-plane` is an umbrella chart. Its ingress subchart is named
+# `ingress` (Chart.yaml), and the subchart's OWN top-level keys are `traefik:`
+# and `ingress:`. Helm nests subchart values under the subchart's name in the
+# parent's values, so the fully-qualified path from the PARENT chart's values
+# is `ingress.ingress.annotations` (double-nested — that outer `ingress:` is
+# the subchart name).
+#
+# Confirm on your live release with:
+#   helm get values hubble -n default
+# The block below (from `ingress:` to the end) is a drop-in overlay you can
+# either paste into your existing values-<env>.yaml file (merging with the
+# `ingress:` block that's already there) or pass as an extra `-f` file.
+# ────────────────────────────────────────────────────────────────────────────
+#
+# The Traefik LoadBalancer service is rendered from
+#   vertex/spectro-mgmt-plane/charts/ingress/templates/services-traefik.yaml
+# and reads `.Values.ingress.annotations` (subchart-relative — that's why the
+# parent chart's values path is `ingress.ingress.annotations`).
+#
+# With this values shape:
+#   - `ingress.ingress.annotations` is empty → the
+#     {{ if gt (len .Values.ingress.annotations) 0 }} block skips → the Service
+#     has NO aws-load-balancer-type annotation.
+#   - AWS's in-tree cloud-controller defaults an unannotated LoadBalancer to
+#     a Classic ELB.
+#   - `ingressStaticIP` renders spec.loadBalancerIP if set, but AWS Classic ELB
+#     does NOT support pre-specifying the LB IP — no-op on AWS today.
+#   - `terminateHTTPSAtLoadBalancer: false` means the Service targets `websecure`
+#     (Traefik's TLS listener) so Traefik terminates HTTPS; the LB just passes
+#     TCP/443 through.
+#
+# What's rendered (verified live on the mgmt cluster):
+#   Service ingress-traefik/traefik-ingress-controller
+#     type: LoadBalancer
+#     externalTrafficPolicy: Local
+#     annotations:                             # (only helm.sh/release metadata)
+#     ports:
+#       - 80  → web        (Traefik plain-HTTP entrypoint)
+#       - 443 → websecure  (Traefik TLS-terminating entrypoint)
+#
+# Result:
+#   hostname: <32hex>-<n>.<region>.elb.amazonaws.com   (Classic ELB signature)
+#   IP:       rotates under AWS maintenance windows
+#             → every rotation invalidates /etc/hosts pins, tenant-cluster
+#               CoreDNS phone-home entries, cluster-profile mgmt_elb_ip vars.
+# =============================================================================
+
+# Outer `ingress:` = the subchart alias in the parent chart.
+ingress:
+  # Parent-chart flag: enables the ingress subchart. Leave true.
+  enabled: true
+
+  # Subchart's top-level `traefik:` block (subchart-relative .Values.traefik).
+  traefik:
+    hostPort: false        # cloud LoadBalancer (ELB); true = node hostPort (appliance mode)
+
+  # Subchart's top-level `ingress:` block (subchart-relative .Values.ingress).
+  # THIS is where the Service annotations live — the "double-nesting" people miss.
+  ingress:
+    # Empty map → NO annotations → Classic ELB.
+    annotations: {}
+    # Ignored on AWS Classic; leave empty.
+    ingressStaticIP: ""
+    # HTTPS terminates at Traefik, not at the LB.
+    terminateHTTPSAtLoadBalancer: false

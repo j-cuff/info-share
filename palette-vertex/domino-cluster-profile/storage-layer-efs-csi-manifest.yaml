@@ -1,0 +1,188 @@
+# =============================================================================
+# Palette Infra-profile STORAGE layer via "Add Manifest" (Option 3) — PROTOTYPE.
+# Deploys the AWS EFS CSI driver using DOMINO'S OWN mirrored images (ECR) and the
+# dominoshared (RWX) StorageClass. Solves the missing csi-aws-efs pack.
+#
+# Pair with csi-aws-ebs PACK (the required CSI layer → dominodisk/block/RWO) OR add
+# the EBS driver the same way. This manifest = the EFS/RWX half.
+#
+# Palette EKS infra profiles REQUIRE a storage layer; Palette 2.7+ lets that layer be
+# a pack, a Helm chart (Option 2), or this raw manifest (Option 3).
+#
+# Parameterize the EFS filesystem id with a profile variable so it ports across
+# environments:
+#   fileSystemId: '{{.spectro.var.STORAGE_EFS_ID}}'   (created by your Phase 3 prereqs)
+#
+# Image paths — the six `image:` lines below reference an ECR mirror of Domino's
+# EFS CSI images using the format:
+#   <ECR_REGISTRY>/<DOMINO_PREFIX>/<image>:<tag>
+# Substitute your own registry + prefix (either sed the file before terraform apply,
+# or extend the `replace()` call in host-cluster-profile.tf to swap these strings
+# alongside the EFS id). See the README next to this file.
+# =============================================================================
+---
+apiVersion: storage.k8s.io/v1
+kind: CSIDriver
+metadata:
+  name: efs.csi.aws.com
+spec:
+  attachRequired: false
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: efs-csi-controller-sa
+  namespace: kube-system
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: efs-csi-node-sa
+  namespace: kube-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: efs-csi-external-provisioner-role
+rules:
+  - apiGroups: [""]
+    resources: ["persistentvolumes"]
+    verbs: ["get", "list", "watch", "create", "delete"]
+  - apiGroups: [""]
+    resources: ["persistentvolumeclaims"]
+    verbs: ["get", "list", "watch", "update"]
+  - apiGroups: ["storage.k8s.io"]
+    resources: ["storageclasses"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["get", "list", "watch", "create", "update", "patch"]
+  - apiGroups: ["storage.k8s.io"]
+    resources: ["csinodes"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get", "list", "watch"]
+  # REQUIRED for the csi-provisioner sidecar's --leader-election (else it can't acquire the
+  # lease and NO volumes provision — PVCs sit Pending "Waiting for a volume to be created").
+  # Learned 2026-07-10 on domino-efs; the hand-rolled prototype omitted this.
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get", "watch", "list", "delete", "update", "create"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: efs-csi-provisioner-binding
+subjects:
+  - kind: ServiceAccount
+    name: efs-csi-controller-sa
+    namespace: kube-system
+roleRef:
+  kind: ClusterRole
+  name: efs-csi-external-provisioner-role
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: efs-csi-controller
+  namespace: kube-system
+spec:
+  replicas: 2
+  selector:
+    matchLabels: {app: efs-csi-controller}
+  template:
+    metadata:
+      labels: {app: efs-csi-controller}
+    spec:
+      serviceAccountName: efs-csi-controller-sa
+      priorityClassName: system-cluster-critical
+      tolerations:
+        - operator: Exists
+      containers:
+        - name: efs-plugin
+          image: <ECR_REGISTRY>/<DOMINO_PREFIX>/operations-aws-efs-csi-driver-docker:2.3.1-r10
+          args: ["--endpoint=$(CSI_ENDPOINT)", "--logtostderr", "--v=2", "--delete-access-point-root-dir=false"]
+          env:
+            - {name: CSI_ENDPOINT, value: unix:///var/lib/csi/sockets/pluginproxy/csi.sock}
+            - name: CSI_NODE_NAME       # REQUIRED — driver crashes "CSI_NODE_NAME env var not set" without it
+              valueFrom: {fieldRef: {fieldPath: spec.nodeName}}
+          volumeMounts:
+            - {name: socket-dir, mountPath: /var/lib/csi/sockets/pluginproxy/}
+        - name: csi-provisioner
+          image: <ECR_REGISTRY>/<DOMINO_PREFIX>/operations-csi-provisioner-docker:6.2.0-r6
+          args: ["--csi-address=$(ADDRESS)", "--v=2", "--feature-gates=Topology=true", "--extra-create-metadata", "--leader-election"]
+          env:
+            - {name: ADDRESS, value: /var/lib/csi/sockets/pluginproxy/csi.sock}
+          volumeMounts:
+            - {name: socket-dir, mountPath: /var/lib/csi/sockets/pluginproxy/}
+        - name: liveness-probe
+          image: <ECR_REGISTRY>/<DOMINO_PREFIX>/operations-csi-livenessprobe-docker:2.18.0-r17
+          args: ["--csi-address=/csi/csi.sock", "--health-port=9909"]
+          volumeMounts:
+            - {name: socket-dir, mountPath: /csi}
+      volumes:
+        - {name: socket-dir, emptyDir: {}}
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: efs-csi-node
+  namespace: kube-system
+spec:
+  selector:
+    matchLabels: {app: efs-csi-node}
+  template:
+    metadata:
+      labels: {app: efs-csi-node}
+    spec:
+      serviceAccountName: efs-csi-node-sa
+      hostNetwork: true
+      priorityClassName: system-node-critical
+      tolerations:
+        - operator: Exists
+      containers:
+        - name: efs-plugin
+          securityContext: {privileged: true}
+          image: <ECR_REGISTRY>/<DOMINO_PREFIX>/operations-aws-efs-csi-driver-docker:2.3.1-r10
+          args: ["--endpoint=$(CSI_ENDPOINT)", "--logtostderr", "--v=2"]
+          env:
+            - {name: CSI_ENDPOINT, value: unix:/csi/csi.sock}
+            - name: CSI_NODE_NAME       # REQUIRED
+              valueFrom: {fieldRef: {fieldPath: spec.nodeName}}
+          volumeMounts:
+            - {name: kubelet-dir, mountPath: /var/lib/kubelet, mountPropagation: "Bidirectional"}
+            - {name: plugin-dir, mountPath: /csi}
+            - {name: efs-state-dir, mountPath: /var/run/efs}
+        - name: csi-driver-registrar
+          image: <ECR_REGISTRY>/<DOMINO_PREFIX>/operations-csi-node-driver-registrar-docker:2.16.0-r7
+          args: ["--csi-address=$(ADDRESS)", "--kubelet-registration-path=$(DRIVER_REG_SOCK_PATH)", "--v=2"]
+          env:
+            - {name: ADDRESS, value: /csi/csi.sock}
+            - {name: DRIVER_REG_SOCK_PATH, value: /var/lib/kubelet/plugins/efs.csi.aws.com/csi.sock}
+          volumeMounts:
+            - {name: plugin-dir, mountPath: /csi}
+            - {name: registration-dir, mountPath: /registration}
+        - name: liveness-probe
+          image: <ECR_REGISTRY>/<DOMINO_PREFIX>/operations-csi-livenessprobe-docker:2.18.0-r17
+          args: ["--csi-address=/csi/csi.sock", "--health-port=9809"]
+          volumeMounts:
+            - {name: plugin-dir, mountPath: /csi}
+      volumes:
+        - {name: kubelet-dir, hostPath: {path: /var/lib/kubelet, type: Directory}}
+        - {name: plugin-dir, hostPath: {path: /var/lib/kubelet/plugins/efs.csi.aws.com/, type: DirectoryOrCreate}}
+        - {name: registration-dir, hostPath: {path: /var/lib/kubelet/plugins_registry/, type: Directory}}
+        - {name: efs-state-dir, hostPath: {path: /var/run/efs, type: DirectoryOrCreate}}
+---
+# Domino RWX StorageClass — exact name matters to Domino (storage_classes.shared.name)
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: dominoshared
+provisioner: efs.csi.aws.com
+volumeBindingMode: Immediate
+parameters:
+  provisioningMode: efs-ap
+  fileSystemId: '{{.spectro.var.STORAGE_EFS_ID}}'   # EFS created in Phase 3 (phase3-aws-prereqs.sh)
+  directoryPerms: "700"
